@@ -4,7 +4,7 @@ resource "aws_instance" "nodejs_server" {
   instance_type          = var.instance_type
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.nodejs_sg.id]
-  subnet_id = var.subnet_id
+  subnet_id              = var.subnet_id
 
   root_block_device {
     volume_size = 10
