@@ -75,7 +75,9 @@ pipeline {
                 dir('practical2') {
                     sh '''
                         terraform apply -input=false -auto-approve tfplan
-                        terraform output -raw public_ip > deploy_ip.txt
+
+                        terraform output -raw public_ip > deploy_public_ip.txt
+                        terraform output -raw private_ip > deploy_private_ip.txt
                     '''
                 }
             }
@@ -137,7 +139,11 @@ pipeline {
                     sh '''
                         set +x
 
-                        DEPLOY_IP=$(cat practical2/deploy_ip.txt)
+                        DEPLOY_IP=$(cat practical2/deploy_public_ip.txt)
+                        SSH_IP=$(cat practical2/deploy_private_ip.txt)
+
+                        echo "Application Public IP: $DEPLOY_IP"
+                        echo "SSH Private IP: $SSH_IP"
 
                         cat > .env.deploy <<EOF
 DOMAIN=http://${DEPLOY_IP}:3000
@@ -151,7 +157,7 @@ EOF
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo apt-get update -y &&
                              sudo apt-get install -y docker.io &&
                              sudo systemctl enable --now docker"
@@ -159,27 +165,27 @@ EOF
                         scp -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
                             .env.deploy \
-                            "$SSH_USER@$DEPLOY_IP:/home/$SSH_USER/.env"
+                            "$SSH_USER@$SSH_IP:/home/$SSH_USER/.env"
 
                         printf '%s' "$DOCKER_PASS" |
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo docker login -u '$DOCKER_USER' --password-stdin"
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo docker pull '$IMAGE_NAME'"
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo docker rm -f nodejs-app || true"
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo docker run -d \
                              --name nodejs-app \
                              --restart unless-stopped \
@@ -189,7 +195,7 @@ EOF
 
                         ssh -i "$SSH_KEY" \
                             -o StrictHostKeyChecking=no \
-                            "$SSH_USER@$DEPLOY_IP" \
+                            "$SSH_USER@$SSH_IP" \
                             "sudo docker ps"
                     '''
                 }

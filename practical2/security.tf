@@ -4,16 +4,17 @@ resource "aws_security_group" "nodejs_sg" {
   description = "Security group for Node.js deployment server"
 
   # SSH access
+    # SSH access
   ingress {
-
-
-    description = "SSH from Jenkins controller"
+    description = "SSH access"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["172.31.1.243/32"]
+    cidr_blocks = [
+      var.my_ip,
+      "172.31.1.243/32"
+    ]
   }
-
   # Node.js application
   ingress {
     description = "Node.js application port"
