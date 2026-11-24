@@ -1,6 +1,6 @@
 
 resource "aws_security_group" "nodejs_sg" {
-  name        = "nodejs-deployment-sg"
+  name        = "lum"
   description = "Security group for Node.js deployment server"
 
   # SSH access
@@ -30,6 +30,6 @@ resource "aws_security_group" "nodejs_sg" {
   }
 
   tags = {
-    Name = "nodejs-deployment-sg"
+    Name = "lum"
   }
 }
