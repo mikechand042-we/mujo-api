@@ -8,14 +8,14 @@ pipeline {
     }
 
     environment {
-        AWS_DEFAULT_REGION  = 'us-east-1'
-        TF_VAR_region       = 'us-east-1'
-        TF_VAR_ami_id       = 'ami-0b6d9d3d33ba97d99'
+        AWS_DEFAULT_REGION   = 'us-east-1'
+        TF_VAR_region        = 'us-east-1'
+        TF_VAR_ami_id        = 'ami-0b6d9d3d33ba97d99'
         TF_VAR_instance_type = 't3.micro'
-        TF_VAR_key_name     = 'one-key'
-        TF_VAR_my_ip        = '149.71.34.110/32'
-        TF_VAR_subnet_id    = 'subnet-06629a8410d116cf2'
-        TF_VAR_vpc_id       = 'vpc-0c4b8db8fbb200e08'
+        TF_VAR_key_name      = 'one-key'
+        TF_VAR_my_ip         = '149.71.34.110/32'
+        TF_VAR_subnet_id     = 'subnet-06629a8410d116cf2'
+        TF_VAR_vpc_id        = 'vpc-0c4b8db8fbb200e08'
     }
 
     stages {
@@ -29,11 +29,13 @@ pipeline {
         stage('Test') {
             steps {
                 sh '''
+                    set -e
+
                     docker run --rm \
-                    -v "$WORKSPACE/practical2:/app" \
-                    -w /app \
-                    node:18-alpine \
-                    node --check server.js
+                        -v "$WORKSPACE/practical2:/app" \
+                        -w /app \
+                        node:18-alpine \
+                        node --check server.js
                 '''
             }
         }
@@ -46,9 +48,12 @@ pipeline {
                     reuseNode true
                 }
             }
+
             steps {
                 dir('practical2') {
                     sh '''
+                        set -e
+
                         terraform init
                         terraform fmt -check
                         terraform validate
@@ -72,9 +77,12 @@ pipeline {
                     reuseNode true
                 }
             }
+
             steps {
                 dir('practical2') {
                     sh '''
+                        set -e
+
                         terraform apply -input=false -auto-approve tfplan
 
                         terraform output -raw public_ip > deploy_public_ip.txt
@@ -100,10 +108,12 @@ pipeline {
 
                     dir('practical2') {
                         sh '''
+                            set -e
                             set +x
 
                             echo "$DOCKER_PASS" | docker login \
-                                -u "$DOCKER_USER" --password-stdin
+                                -u "$DOCKER_USER" \
+                                --password-stdin
 
                             docker build -t "$IMAGE_NAME" .
                             docker push "$IMAGE_NAME"
@@ -132,6 +142,11 @@ pipeline {
                         variable: 'STRIPE_SECRET_KEY'
                     )
                 ]) {
+                    script {
+                        env.IMAGE_NAME =
+                            "${env.DOCKER_USER}/nodejs-stripe-app:${env.BUILD_NUMBER}"
+                    }
+
                     sh '''
                         set +x
                         set -e
@@ -145,7 +160,8 @@ pipeline {
                         echo "Deployment Instance: $INSTANCE_ID"
                         echo "Application URL: http://$DEPLOY_IP:3000"
 
-                        # Store deployment secrets securely in SSM Parameter Store
+                        # Save secrets in AWS Parameter Store
+
                         aws ssm put-parameter \
                             --name "/practical2/docker-user" \
                             --type SecureString \
@@ -170,7 +186,8 @@ pipeline {
                             --value "$STRIPE_SECRET_KEY" \
                             --overwrite
 
-                        # Wait for EC2 to register as an SSM managed instance
+                        # Wait for EC2 SSM connection
+
                         ONLINE=false
 
                         for i in $(seq 1 30); do
@@ -184,21 +201,28 @@ pipeline {
                                 break
                             fi
 
-                            echo "Waiting for SSM agent... attempt $i"
+                            echo "Waiting for SSM Agent: attempt $i/30"
                             sleep 10
                         done
 
                         if [ "$ONLINE" != "true" ]; then
-                            echo "EC2 instance is not online in SSM."
+                            echo "ERROR: EC2 instance did not become Online in SSM."
                             exit 1
                         fi
 
-                        # Create deployment script without embedding credentials
+                        # Create remote deployment script
+
                         cat > remote-deploy.sh <<'REMOTE'
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+
+trap 'echo "DEPLOYMENT ERROR at line $LINENO (exit code $?)"' ERR
 
 export AWS_DEFAULT_REGION=us-east-1
+
+echo "Starting EC2 deployment..."
+
+# Read secrets from Parameter Store
 
 get_parameter() {
     aws ssm get-parameter \
@@ -213,13 +237,38 @@ DOCKER_PASS=$(get_parameter "/practical2/docker-pass")
 STRIPE_PUBLISHABLE_KEY=$(get_parameter "/practical2/stripe-publishable-key")
 STRIPE_SECRET_KEY=$(get_parameter "/practical2/stripe-secret-key")
 
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+echo "Secrets retrieved successfully."
+
+# Install Docker and AWS CLI according to operating system
+
+if command -v apt-get >/dev/null 2>&1; then
+
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+
+elif command -v dnf >/dev/null 2>&1; then
+
+    dnf install -y docker awscli
+
+elif command -v yum >/dev/null 2>&1; then
+
+    yum install -y docker awscli
+
+else
+    echo "ERROR: Unsupported operating system package manager."
+    exit 1
+fi
+
+# Start Docker
 
 systemctl enable --now docker
 
+# Docker Hub login
+
 printf '%s' "$DOCKER_PASS" |
     docker login -u "$DOCKER_USER" --password-stdin
+
+# Create application environment file
 
 cat > /opt/nodejs-app.env <<ENVFILE
 DOMAIN=http://DEPLOY_IP_PLACEHOLDER:3000
@@ -231,9 +280,15 @@ ENVFILE
 
 chmod 600 /opt/nodejs-app.env
 
+# Pull latest build
+
 docker pull IMAGE_NAME_PLACEHOLDER
 
+# Replace existing application container
+
 docker rm -f nodejs-app || true
+
+# Start application
 
 docker run -d \
     --name nodejs-app \
@@ -244,8 +299,21 @@ docker run -d \
 
 docker logout
 
-docker ps
+echo "Application container status:"
+docker ps --filter name=nodejs-app
+
+# Verify container is running
+
+if [ "$(docker inspect -f '{{.State.Running}}' nodejs-app)" != "true" ]; then
+    echo "ERROR: Application container is not running."
+    docker logs nodejs-app
+    exit 1
+fi
+
+echo "Deployment completed successfully."
 REMOTE
+
+                        # Replace deployment placeholders
 
                         sed -i \
                             "s|DEPLOY_IP_PLACEHOLDER|$DEPLOY_IP|g" \
@@ -255,11 +323,15 @@ REMOTE
                             "s|IMAGE_NAME_PLACEHOLDER|$IMAGE_NAME|g" \
                             remote-deploy.sh
 
+                        # Encode script for SSM
+
                         SCRIPT_B64=$(base64 -w0 remote-deploy.sh)
 
                         PARAMS=$(python3 -c \
                             'import json,sys; print(json.dumps({"commands":["echo "+sys.argv[1]+" | base64 -d > /tmp/deploy.sh && chmod 700 /tmp/deploy.sh && /tmp/deploy.sh"]}))' \
                             "$SCRIPT_B64")
+
+                        # Send deployment command
 
                         COMMAND_ID=$(aws ssm send-command \
                             --instance-ids "$INSTANCE_ID" \
@@ -271,17 +343,33 @@ REMOTE
 
                         echo "SSM Command ID: $COMMAND_ID"
 
-                        aws ssm wait command-executed \
+                        # Wait and print actual error if deployment fails
+
+                        if ! aws ssm wait command-executed \
                             --command-id "$COMMAND_ID" \
-                            --instance-id "$INSTANCE_ID"
+                            --instance-id "$INSTANCE_ID"; then
+
+                            echo "========== SSM DEPLOYMENT FAILED =========="
+
+                            aws ssm get-command-invocation \
+                                --command-id "$COMMAND_ID" \
+                                --instance-id "$INSTANCE_ID" \
+                                --query '{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                                --output json || true
+
+                            exit 1
+                        fi
+
+                        echo "========== DEPLOYMENT OUTPUT =========="
 
                         aws ssm get-command-invocation \
                             --command-id "$COMMAND_ID" \
                             --instance-id "$INSTANCE_ID" \
-                            --query 'StandardOutputContent' \
-                            --output text
+                            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                            --output json
 
                         echo "Application deployed through AWS SSM."
+                        echo "Application URL: http://$DEPLOY_IP:3000"
                     '''
                 }
             }
@@ -294,11 +382,14 @@ REMOTE
         }
 
         failure {
-            echo 'Pipeline failed. Check Jenkins console output.'
+            echo 'Pipeline failed. Check the actual error in Jenkins Console Output.'
         }
 
         always {
-            sh 'rm -f .env.deploy remote-deploy.sh'
+            sh '''
+                rm -f .env.deploy remote-deploy.sh
+                rm -f practical2/remote-deploy.sh
+            '''
         }
     }
 }
