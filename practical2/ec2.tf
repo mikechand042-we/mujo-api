@@ -44,3 +44,22 @@ resource "aws_instance" "nodejs_server" {
     Environment = "Practical-2"
   }
 }
+
+resource "aws_iam_role_policy" "nodejs_ssm_parameters" {
+  name = "nodejs-ssm-parameter-read"
+  role = aws_iam_role.nodejs_ssm.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter"
+        ]
+        Resource = "arn:aws:ssm:us-east-1:824232273986:parameter/practical2/*"
+      }
+    ]
+  })
+}
