@@ -216,11 +216,55 @@ pipeline {
 #!/bin/bash
 set -Eeuo pipefail
 
-trap 'echo "DEPLOYMENT ERROR at line $LINENO (exit code $?)"' ERR
+trap 'rc=$?; echo "DEPLOYMENT ERROR at line $LINENO (exit code $rc)"' ERR
 
 export AWS_DEFAULT_REGION=us-east-1
 
 echo "Starting EC2 deployment..."
+
+# Install Docker and AWS CLI BEFORE using aws commands
+
+if ! command -v aws >/dev/null 2>&1 || ! command -v docker >/dev/null 2>&1; then
+
+    if command -v apt-get >/dev/null 2>&1; then
+
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+
+    elif command -v dnf >/dev/null 2>&1; then
+
+        dnf install -y docker awscli
+
+    elif command -v yum >/dev/null 2>&1; then
+
+        yum install -y docker awscli
+
+    else
+        echo "ERROR: Unsupported operating system package manager."
+        exit 1
+    fi
+fi
+
+# Verify AWS CLI and Docker
+
+if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: AWS CLI installation failed."
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: Docker installation failed."
+    exit 1
+fi
+
+aws --version
+docker --version
+
+# Start Docker
+
+systemctl enable --now docker
+
+echo "AWS CLI and Docker are ready."
 
 # Read secrets from Parameter Store
 
@@ -239,30 +283,6 @@ STRIPE_SECRET_KEY=$(get_parameter "/practical2/stripe-secret-key")
 
 echo "Secrets retrieved successfully."
 
-# Install Docker and AWS CLI according to operating system
-
-if command -v apt-get >/dev/null 2>&1; then
-
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
-
-elif command -v dnf >/dev/null 2>&1; then
-
-    dnf install -y docker awscli
-
-elif command -v yum >/dev/null 2>&1; then
-
-    yum install -y docker awscli
-
-else
-    echo "ERROR: Unsupported operating system package manager."
-    exit 1
-fi
-
-# Start Docker
-
-systemctl enable --now docker
-
 # Docker Hub login
 
 printf '%s' "$DOCKER_PASS" |
@@ -280,7 +300,7 @@ ENVFILE
 
 chmod 600 /opt/nodejs-app.env
 
-# Pull latest build
+# Pull Docker image
 
 docker pull IMAGE_NAME_PLACEHOLDER
 
