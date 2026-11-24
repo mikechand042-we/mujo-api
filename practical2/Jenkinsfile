@@ -13,6 +13,8 @@ pipeline {
         TF_VAR_instance_type = 't3.micro'
         TF_VAR_key_name      = 'one-key'
         TF_VAR_my_ip         = '149.71.34.110/32'
+        TF_VAR_subnet_id     = 'subnet-06629a8410d116cf2'
+        TF_VAR_vpc_id        = 'vpc-0c4b8db8fbb200e08'
     }
 
     stages {
@@ -199,9 +201,11 @@ EOF
         success {
             echo 'Node.js application deployed successfully!'
         }
+
         failure {
             echo 'Pipeline failed. Check Jenkins console output.'
         }
+
         always {
             sh 'rm -f .env.deploy'
         }
