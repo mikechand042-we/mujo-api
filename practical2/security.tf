@@ -5,7 +5,7 @@ resource "aws_security_group" "nodejs_sg" {
 
   # SSH access
   ingress {
-    
+
 
     description = "SSH from Jenkins controller"
     from_port   = 22
