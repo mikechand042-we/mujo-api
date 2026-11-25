@@ -1,4 +1,3 @@
-
 name: My First GitHub Action
 
 on: [push]
@@ -7,10 +6,6 @@ jobs:
   build:
     runs-on: ubuntu-24.04
 
-    strategy:
-      matrix:
-        python-version: ["3.11"]
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -18,7 +13,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -27,4 +22,5 @@ jobs:
 
       - name: Run test
         run: |
-          python -m pytest src/addition.py
+          cd github-action/src
+          python -m pytest addition.py
