@@ -1,0 +1,415 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_DEFAULT_REGION   = 'us-east-1'
+        TF_VAR_region        = 'us-east-1'
+        TF_VAR_ami_id        = 'ami-0b6d9d3d33ba97d99'
+        TF_VAR_instance_type = 't3.micro'
+        TF_VAR_key_name      = 'one-key'
+        TF_VAR_my_ip         = '149.71.34.110/32'
+        TF_VAR_subnet_id     = 'subnet-06629a8410d116cf2'
+        TF_VAR_vpc_id        = 'vpc-0c4b8db8fbb200e08'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh '''
+                    set -e
+
+                    docker run --rm \
+                        -v "$WORKSPACE/practical2:/app" \
+                        -w /app \
+                        node:18-alpine \
+                        node --check server.js
+                '''
+            }
+        }
+
+        stage('Terraform Init & Plan') {
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.5'
+                    args '--entrypoint="" --network host'
+                    reuseNode true
+                }
+            }
+
+            steps {
+                dir('practical2') {
+                    sh '''
+                        set -e
+
+                        terraform init
+                        terraform fmt -check
+                        terraform validate
+                        terraform plan -input=false -out=tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Manual Approval') {
+            steps {
+                input message: 'Approve Deployment EC2 changes?'
+            }
+        }
+
+        stage('Terraform Apply') {
+            agent {
+                docker {
+                    image 'hashicorp/terraform:1.16.5'
+                    args '--entrypoint="" --network host'
+                    reuseNode true
+                }
+            }
+
+            steps {
+                dir('practical2') {
+                    sh '''
+                        set -e
+
+                        terraform apply -input=false -auto-approve tfplan
+
+                        terraform output -raw public_ip > deploy_public_ip.txt
+                        terraform output -raw instance_id > deploy_instance_id.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    script {
+                        env.IMAGE_NAME =
+                            "${env.DOCKER_USER}/nodejs-stripe-app:${env.BUILD_NUMBER}"
+                    }
+
+                    dir('practical2') {
+                        sh '''
+                            set -e
+                            set +x
+
+                            echo "$DOCKER_PASS" | docker login \
+                                -u "$DOCKER_USER" \
+                                --password-stdin
+
+                            docker build -t "$IMAGE_NAME" .
+                            docker push "$IMAGE_NAME"
+
+                            docker logout
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy via AWS SSM') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    ),
+                    string(
+                        credentialsId: 'stripe-publishable-key',
+                        variable: 'STRIPE_PUBLISHABLE_KEY'
+                    ),
+                    string(
+                        credentialsId: 'stripe-secret-key',
+                        variable: 'STRIPE_SECRET_KEY'
+                    )
+                ]) {
+                    script {
+                        env.IMAGE_NAME =
+                            "${env.DOCKER_USER}/nodejs-stripe-app:${env.BUILD_NUMBER}"
+                    }
+
+                    sh '''
+                        set +x
+                        set -e
+
+                        command -v aws
+                        command -v python3
+
+                        INSTANCE_ID=$(cat practical2/deploy_instance_id.txt)
+                        DEPLOY_IP=$(cat practical2/deploy_public_ip.txt)
+
+                        echo "Deployment Instance: $INSTANCE_ID"
+                        echo "Application URL: http://$DEPLOY_IP:3000"
+
+                        # Save secrets in AWS Parameter Store
+
+                        aws ssm put-parameter \
+                            --name "/practical2/docker-user" \
+                            --type SecureString \
+                            --value "$DOCKER_USER" \
+                            --overwrite
+
+                        aws ssm put-parameter \
+                            --name "/practical2/docker-pass" \
+                            --type SecureString \
+                            --value "$DOCKER_PASS" \
+                            --overwrite
+
+                        aws ssm put-parameter \
+                            --name "/practical2/stripe-publishable-key" \
+                            --type SecureString \
+                            --value "$STRIPE_PUBLISHABLE_KEY" \
+                            --overwrite
+
+                        aws ssm put-parameter \
+                            --name "/practical2/stripe-secret-key" \
+                            --type SecureString \
+                            --value "$STRIPE_SECRET_KEY" \
+                            --overwrite
+
+                        # Wait for EC2 SSM connection
+
+                        ONLINE=false
+
+                        for i in $(seq 1 30); do
+                            STATUS=$(aws ssm describe-instance-information \
+                                --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+                                --query 'InstanceInformationList[0].PingStatus' \
+                                --output text 2>/dev/null || true)
+
+                            if [ "$STATUS" = "Online" ]; then
+                                ONLINE=true
+                                break
+                            fi
+
+                            echo "Waiting for SSM Agent: attempt $i/30"
+                            sleep 10
+                        done
+
+                        if [ "$ONLINE" != "true" ]; then
+                            echo "ERROR: EC2 instance did not become Online in SSM."
+                            exit 1
+                        fi
+
+                        # Create remote deployment script
+
+                        cat > remote-deploy.sh <<'REMOTE'
+#!/bin/bash
+set -Eeuo pipefail
+
+trap 'rc=$?; echo "DEPLOYMENT ERROR at line $LINENO (exit code $rc)"' ERR
+
+export AWS_DEFAULT_REGION=us-east-1
+
+echo "Starting EC2 deployment..."
+
+# Install Docker and AWS CLI BEFORE using aws commands
+
+if ! command -v aws >/dev/null 2>&1 || ! command -v docker >/dev/null 2>&1; then
+
+    if command -v apt-get >/dev/null 2>&1; then
+
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+
+    elif command -v dnf >/dev/null 2>&1; then
+
+        dnf install -y docker awscli
+
+    elif command -v yum >/dev/null 2>&1; then
+
+        yum install -y docker awscli
+
+    else
+        echo "ERROR: Unsupported operating system package manager."
+        exit 1
+    fi
+fi
+
+# Verify AWS CLI and Docker
+
+if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: AWS CLI installation failed."
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: Docker installation failed."
+    exit 1
+fi
+
+aws --version
+docker --version
+
+# Start Docker
+
+systemctl enable --now docker
+
+echo "AWS CLI and Docker are ready."
+
+# Read secrets from Parameter Store
+
+get_parameter() {
+    aws ssm get-parameter \
+        --name "$1" \
+        --with-decryption \
+        --query 'Parameter.Value' \
+        --output text
+}
+
+DOCKER_USER=$(get_parameter "/practical2/docker-user")
+DOCKER_PASS=$(get_parameter "/practical2/docker-pass")
+STRIPE_PUBLISHABLE_KEY=$(get_parameter "/practical2/stripe-publishable-key")
+STRIPE_SECRET_KEY=$(get_parameter "/practical2/stripe-secret-key")
+
+echo "Secrets retrieved successfully."
+
+# Docker Hub login
+
+printf '%s' "$DOCKER_PASS" |
+    docker login -u "$DOCKER_USER" --password-stdin
+
+# Create application environment file
+
+cat > /opt/nodejs-app.env <<ENVFILE
+DOMAIN=http://DEPLOY_IP_PLACEHOLDER:3000
+PORT=3000
+STATIC_DIR=./client
+PUBLISHABLE_KEY=$STRIPE_PUBLISHABLE_KEY
+SECRET_KEY=$STRIPE_SECRET_KEY
+ENVFILE
+
+chmod 600 /opt/nodejs-app.env
+
+# Pull Docker image
+
+docker pull IMAGE_NAME_PLACEHOLDER
+
+# Replace existing application container
+
+docker rm -f nodejs-app || true
+
+# Start application
+
+docker run -d \
+    --name nodejs-app \
+    --restart unless-stopped \
+    -p 3000:3000 \
+    --env-file /opt/nodejs-app.env \
+    IMAGE_NAME_PLACEHOLDER
+
+docker logout
+
+echo "Application container status:"
+docker ps --filter name=nodejs-app
+
+# Verify container is running
+
+if [ "$(docker inspect -f '{{.State.Running}}' nodejs-app)" != "true" ]; then
+    echo "ERROR: Application container is not running."
+    docker logs nodejs-app
+    exit 1
+fi
+
+echo "Deployment completed successfully."
+REMOTE
+
+                        # Replace deployment placeholders
+
+                        sed -i \
+                            "s|DEPLOY_IP_PLACEHOLDER|$DEPLOY_IP|g" \
+                            remote-deploy.sh
+
+                        sed -i \
+                            "s|IMAGE_NAME_PLACEHOLDER|$IMAGE_NAME|g" \
+                            remote-deploy.sh
+
+                        # Encode script for SSM
+
+                        SCRIPT_B64=$(base64 -w0 remote-deploy.sh)
+
+                        PARAMS=$(python3 -c \
+                            'import json,sys; print(json.dumps({"commands":["echo "+sys.argv[1]+" | base64 -d > /tmp/deploy.sh && chmod 700 /tmp/deploy.sh && /tmp/deploy.sh"]}))' \
+                            "$SCRIPT_B64")
+
+                        # Send deployment command
+
+                        COMMAND_ID=$(aws ssm send-command \
+                            --instance-ids "$INSTANCE_ID" \
+                            --document-name "AWS-RunShellScript" \
+                            --parameters "$PARAMS" \
+                            --comment "Node.js application deployment" \
+                            --query 'Command.CommandId' \
+                            --output text)
+
+                        echo "SSM Command ID: $COMMAND_ID"
+
+                        # Wait and print actual error if deployment fails
+
+                        if ! aws ssm wait command-executed \
+                            --command-id "$COMMAND_ID" \
+                            --instance-id "$INSTANCE_ID"; then
+
+                            echo "========== SSM DEPLOYMENT FAILED =========="
+
+                            aws ssm get-command-invocation \
+                                --command-id "$COMMAND_ID" \
+                                --instance-id "$INSTANCE_ID" \
+                                --query '{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                                --output json || true
+
+                            exit 1
+                        fi
+
+                        echo "========== DEPLOYMENT OUTPUT =========="
+
+                        aws ssm get-command-invocation \
+                            --command-id "$COMMAND_ID" \
+                            --instance-id "$INSTANCE_ID" \
+                            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}' \
+                            --output json
+
+                        echo "Application deployed through AWS SSM."
+                        echo "Application URL: http://$DEPLOY_IP:3000"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Node.js application deployed successfully through AWS SSM!'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check the actual error in Jenkins Console Output.'
+        }
+
+        always {
+            sh '''
+                rm -f .env.deploy remote-deploy.sh
+                rm -f practical2/remote-deploy.sh
+            '''
+        }
+    }
+}

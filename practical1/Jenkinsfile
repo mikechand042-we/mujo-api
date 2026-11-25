@@ -1,0 +1,56 @@
+pipeline {
+    agent {
+        docker {
+            image 'hashicorp/terraform:1.16.5'
+            args '--entrypoint=""'
+        }
+    }
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+    stages {
+        stage ('checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage ('terrafom Init') {
+            steps {
+                dir ('practical1'){
+                    sh 'terraform version'
+                    sh 'terraform init'
+                }
+            }
+        }
+        stage ('terraform plan & fmt & validate ') {
+            steps {
+                dir ('practical1') {
+                    sh 'terraform fmt'
+                    sh 'terraform plan -input=false'
+                    sh 'terraform validate'
+                }
+            }
+        }
+        stage ('Manual Approval') {
+            steps {
+                input 'Approve Terraform Apply ?'
+            }
+        }
+        stage ('terraform Apply') {
+            steps {
+                dir ('practical1') {
+                    sh 'terraform apply -input=false -auto-approve'
+                    
+                }
+            }
+        }
+        stage ('verify output') {
+            steps {
+                dir ('practical1') {
+                    sh 'terraform output'
+                }
+            }
+        }
+    }
+}

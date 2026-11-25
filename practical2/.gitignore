@@ -1,0 +1,21 @@
+
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode
+
+# Dependencies
+node_modules/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+tfplan
+crash.log
+crash.*.log
+
+# Deployment secrets
+.env.deploy
